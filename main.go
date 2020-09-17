@@ -18,25 +18,29 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
+// AccessTokenRequest Request to GitLab to request a token
 type AccessTokenRequest struct {
 	GrantType string `json:"grant_type"`
-	Scope     string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
+	Scope     string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab/-/issues/21745
 	Username  string `json:"username"`
 	Password  string `json:"password"`
 }
 
+// AccessTokenResponse Response from GitLab when requesting a token
 type AccessTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	Scope       string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
-	//ExpiresInSeconds int32  `json:"expires_in"` // NB GitLab 10.7.3 does not have this. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
+	AccessToken      string `json:"access_token"`
+	TokenType        string `json:"token_type"`
+	RefreshToken     string `json:"refresh_token"`
+	Scope            string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab/-/issues/21745
+	Created          int32  `json:"created_at"`
+	ExpiresInSeconds int32  `json:"expires_in"` // NB GitLab 10.7.3 does not have this. See https://gitlab.com/gitlab-org/gitlab/-/issues/21745
 }
 
-// see https://docs.gitlab.com/ce/api/oauth2.html#resource-owner-password-credentials
+// GetAccessToken see https://docs.gitlab.com/ce/api/oauth2.html#resource-owner-password-credentials
 func GetAccessToken(gitLabTokenURL, username, password string) (*AccessTokenResponse, error) {
 	requestJSON, err := json.Marshal(&AccessTokenRequest{
 		GrantType: "password",
-		Scope:     "read_repository",
+		Scope:     "read_repository read_api",
 		Username:  username,
 		Password:  password,
 	})
@@ -57,7 +61,15 @@ func GetAccessToken(gitLabTokenURL, username, password string) (*AccessTokenResp
 	if response.StatusCode != 200 {
 		return nil, fmt.Errorf("invalid response %v", response)
 	}
-	// TODO check content-type.
+
+	// If the header is missing, just try to unmarshal it, however, if the content type is provided
+	// verify that we got JSON back.
+	if ct, ok := response.Header["Content-Type"]; ok &&
+		len(ct) > 0 &&
+		!strings.HasPrefix(ct[0], "application/json") {
+
+		return nil, fmt.Errorf("invalid Content Type `%s` for response: %v", ct[0], response)
+	}
 	var accessTokenResponse AccessTokenResponse
 	if err := json.Unmarshal(responseBody, &accessTokenResponse); err != nil {
 		return nil, err
@@ -65,28 +77,86 @@ func GetAccessToken(gitLabTokenURL, username, password string) (*AccessTokenResp
 	return &accessTokenResponse, nil
 }
 
+// GetCachedAccessToken Gets the access token from the cache (validated by the user password).
+// If not found, then the token is requested through the OAuth interface provided by GitLab.
 func GetCachedAccessToken(c *bicache.Bicache, tokenURL, username, password string) ([]byte, error) {
 	hp := blake2b.Sum256([]byte(password))
-	v := c.Get(username)
-	if v != nil {
-		if !bytes.HasPrefix(v.([]byte), hp[:]) {
+	cv := c.Get(username)
+	if cv != nil {
+		v := cv.([]byte)
+		if !bytes.HasPrefix(v, hp[:]) {
 			return nil, fmt.Errorf("invalid password")
 		}
 		log.Printf("Cache-Hit getting access token for username %s", username)
-		return v.([]byte)[len(hp):], nil
-	} else {
-		log.Printf("Cache-Miss getting access token for username %s", username)
-		response, err := GetAccessToken(tokenURL, username, password)
-		if err != nil {
-			return nil, err
-		}
-		if response.TokenType != "bearer" {
-			return nil, fmt.Errorf("Unknown access token type: %s", response.TokenType)
-		}
-		t := []byte(response.AccessToken)
-		v := append(hp[:], t...)
-		c.SetTTL(username, v, 3600)
 		return v[len(hp):], nil
+	}
+
+	log.Printf("Cache-Miss getting access token for username %s", username)
+	response, err := GetAccessToken(tokenURL, username, password)
+	if err != nil {
+		return nil, err
+	}
+	if strings.ToLower(response.TokenType) != "bearer" {
+		return nil, fmt.Errorf("Unknown access token type: `%s`", response.TokenType)
+	}
+	t := []byte(response.AccessToken)
+	v := append(hp[:], t...)
+	var cacheTTL int32
+	if response.ExpiresInSeconds > 1 {
+		log.Printf("Token TTL for user %s provided by GitLab. TTL : %d", username, response.ExpiresInSeconds)
+		cacheTTL = response.ExpiresInSeconds - 1
+	} else {
+		log.Printf("Token TTL for user %s not provided by GitLab. Using default 3600 seconds.", username)
+		cacheTTL = 3600
+	}
+	c.SetTTL(username, v, cacheTTL)
+	return v[len(hp):], nil
+}
+
+// ConvertURIToAPI converts a URI for a RAW file to an API call.
+// If the URI does not contain the exact text `/raw/`, then the
+// original URI is returned. API format for the RAW file is `/api/v4/projects/:id/repository/files/:file_path/raw`
+// The `id` parameter is the project ID, while the `file_path` parameter is the URL
+// encoded file path of the file to be fetched
+func ConvertURIToAPI(orig *url.URL, uri string) *url.URL {
+	if !strings.Contains(uri, "/raw/") {
+		return orig
+	}
+	log.Printf("splitting: %s", uri)
+	idx := strings.Index(uri, "/-/raw/")
+	idxLen:=len("/-/raw/")
+	if idx<0{
+		idx = strings.Index(uri, "/raw/")
+		idxLen=len("/raw/")
+	}
+	projectName := strings.TrimPrefix(uri[0:idx], "/")
+	parts := uri[idx+idxLen:]
+	idx = strings.Index(parts, "/")
+	if idx < 1 {
+		return orig
+	}
+	ref := parts[0:idx]
+	file := parts[idx+1:]
+
+	log.Printf("Project Name: %s", projectName)
+	log.Printf("File Name: %s", file)
+	log.Printf("Ref: %s", ref)
+	path:= fmt.Sprintf("/api/v4/projects/%s/repository/files/%s/raw",
+			url.QueryEscape(projectName),
+			url.QueryEscape(file),
+		)
+	// this is needed because GO Urls are stupid.
+	tnPath, _ := url.QueryUnescape(path)
+
+	qry:=fmt.Sprintf("ref=%s",
+		url.QueryEscape(ref),
+	)
+	return &url.URL{
+		Scheme:   orig.Scheme,
+		Host:     orig.Host,
+		Path:     tnPath,
+		RawPath:  path,
+		RawQuery: qry,
 	}
 }
 
@@ -135,7 +205,7 @@ func main() {
 		r.Header.Set("User-Agent", "gitlab-source-link-proxy") // TODO use this user-agent in all this application http requests.
 		username, password, ok := r.BasicAuth()
 		if !ok {
-			log.Print("There is not basic auth in request")
+			log.Print("There is no basic auth in request")
 			r.Header.Set("Authorization", "")
 			return
 		}
@@ -143,9 +213,12 @@ func main() {
 		if err != nil {
 			log.Printf("Error getting the access token: %v", err)
 			r.Header.Set("Authorization", "")
-		} else {
-			r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+			return
 		}
+		log.Printf("Using token: %s", accessToken)
+		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+		r.URL = ConvertURIToAPI(r.URL, r.RequestURI)
+		log.Printf("New Uri: %v", r.URL)
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		dump, _ := httputil.DumpRequest(r, false)
@@ -158,6 +231,7 @@ func main() {
 			http.Error(w, "HTTP Basic: Access denied", 401)
 			return
 		}
+		log.Printf("request has authentication info, proxying request")
 		reverseProxy.ServeHTTP(w, r)
 	})
 	log.Fatal(http.ListenAndServe(*listenAddressFlag, nil))
